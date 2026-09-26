@@ -5,9 +5,11 @@
  *   三、resolvePlaylist 装配器：模拟只读 GET 缓存（含跨场次、日志缺失）
  *   四、虚拟时间轴纯函数：累计偏移、1×/2×/4× 无关的线性映射、
  *       恰好落在边界进入后一段、零长段显式定位、拖动 clamp、跨段映射原场次时刻
- *   五、清单读写事务：加入 / 移除 / 排序在同一 IndexedDB 读写事务内
+ *   五、段内事件行边界 cutoffIndex / eventVt：段起点只到起点锚点、段末不越过
+ *       终点锚点（同毫秒事件簇按日志行序截断）、pinnedIndex 定位同毫秒具体事件
+ *   六、清单读写事务：加入 / 移除 / 排序在同一 IndexedDB 读写事务内
  *       读当前清单并提交，两个标签页（两条连接）并发增删排序不丢项、不重复
- *   六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
+ *   七、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
  *
  * 运行前提：服务已在 localhost:3000 启动（npm start）。
  */
@@ -213,7 +215,68 @@ async function main() {
   const n = P.nudge(cross, 4500, 1000);
   check('nudge 超出末端 clamp', n.vt === 5000 && n.releaseForce === true);
 
-  console.log('五、清单读写事务：同一读写事务读当前清单并提交，多标签页并发不丢项');
+  console.log('五、段内事件行边界：cutoffIndex / eventVt（时间 + 日志行序共同回放）');
+  // 同一毫秒挤着 确认 → 撤回 → 重发 → 新轮确认：段锚点切在事件簇中间时，
+  // 仅按毫秒折叠会提前显示或执行区间外事件，必须按行号截断
+  const Core = require('../public/replay-core');
+  const cluster = [
+    ev('2026-09-19T10:00:00.000Z', 0, 'session-start', {}),
+    ev('2026-09-19T10:00:01.000Z', 1000, 'cue-started', { seq: 1, text: '甲', targets: ['灯光', '音响'], attemptId: 'a1' }),
+    ev('2026-09-19T10:00:02.000Z', 2000, 'confirm', { seq: 1, position: '灯光', attemptId: 'a1' }),          // idx 2
+    ev('2026-09-19T10:00:02.000Z', 2000, 'cue-recalled', { seq: 1, oldAttemptId: 'a1', reason: '改词' }),    // idx 3
+    ev('2026-09-19T10:00:02.000Z', 2000, 'cue-resent', { seq: 1, text: '甲二', revision: 2, attemptId: 'a2' }), // idx 4
+    ev('2026-09-19T10:00:02.000Z', 2000, 'confirm', { seq: 1, position: '音响', attemptId: 'a2' }),          // idx 5
+    ev('2026-09-19T10:00:03.000Z', 3000, 'cue-completed', { seq: 1, attemptId: 'a2' }),                      // idx 6
+    ev('2026-09-19T10:00:05.000Z', 5000, 'sequence-finished', {}),                                           // idx 7
+  ];
+  // 段锚定 idx 2..4（confirm 灯光 → cue-resent），区间 [2000, 2000] 零时长
+  const segZero = { entryId: 'z', fileId: 'f', runId: 0, startIndex: 2, endIndex: 4, startT: 2000, endT: 2000, durationMs: 0, offsetStart: 0, offsetEnd: 0 };
+  check('段起点只呈现截至起点锚点：cutoff(localT=startT) = startIndex',
+    P.cutoffIndex(segZero, cluster, 2000) === 2);
+  check('段起点现场不含同毫秒锚点后事件（撤回未生效、仍第 1 版）', (() => {
+    const s = Core.foldUntilIndex(cluster, P.cutoffIndex(segZero, cluster, 2000));
+    return s.revision === 1 && !!s.confirmations['灯光'] && s.attempts.length === 0;
+  })());
+  check('对比：毫秒折叠 foldUntil(2000) 会把同毫秒撤回 / 重发全部折入（revision=2）',
+    Core.foldUntil(cluster, 2000).revision === 2);
+  check('段末不越过终点锚点：localT 再大 cutoff 也不超过 endIndex',
+    P.cutoffIndex(segZero, cluster, 99999) === 4 && P.cutoffIndex(segZero, cluster, 2000.5) === 4);
+  check('段末现场不含同毫秒区间外事件（idx5 的新轮确认不进本段）', (() => {
+    const s = Core.foldUntilIndex(cluster, P.cutoffIndex(segZero, cluster, 99999));
+    return s.revision === 2 && !s.confirmations['音响'];
+  })());
+  check('localT 早于段起点（防御）同样回到起点锚点',
+    P.cutoffIndex(segZero, cluster, 1500) === 2 && P.cutoffIndex(segZero, cluster, NaN) === 2);
+  check('pinnedIndex 精确定位同毫秒具体事件（pin idx3：撤回已封存、重发未生效）', (() => {
+    const cut = P.cutoffIndex(segZero, cluster, 2000, 3);
+    const s = Core.foldUntilIndex(cluster, cut);
+    return cut === 3 && s.attempts.length === 1 && s.attempts[0].endState === 'recalled' && s.revision === 1;
+  })());
+  check('pinnedIndex 越界钳制到锚定行范围（pin idx5→4，pin idx0→2）',
+    P.cutoffIndex(segZero, cluster, 2000, 5) === 4 && P.cutoffIndex(segZero, cluster, 2000, 0) === 2);
+  check('pinnedIndex 非整数被忽略，回退时间换算',
+    P.cutoffIndex(segZero, cluster, 2000, 2.5) === 2 && P.cutoffIndex(segZero, cluster, 2000, null) === 2);
+  check('空事件数组防御：cutoff 为 0 且不抛异常',
+    P.cutoffIndex(segZero, [], 2000) === 0 && P.cutoffIndex(segZero, null, 2000) === 0);
+
+  // 正长段：段内 localT 越过起点后，同毫秒的段内事件按行序纳入，段外不越界
+  const segSpan = { entryId: 's', fileId: 'f', runId: 0, startIndex: 3, endIndex: 6, startT: 2000, endT: 3000, durationMs: 1000, offsetStart: 0, offsetEnd: 1000 };
+  check('正长段起点同样只到起点锚点（idx3，不含同毫秒 idx4/5）',
+    P.cutoffIndex(segSpan, cluster, 2000) === 3);
+  check('正长段内 localT 越过起点：同毫秒段内事件纳入（idx5），但不越过终点锚点',
+    P.cutoffIndex(segSpan, cluster, 2000.5) === 5);
+  check('正长段末 localT=endT：截至终点锚点 idx6，不含同毫秒之后的事件',
+    P.cutoffIndex(segSpan, cluster, 3000) === 6);
+
+  // eventVt：段内事件映射回虚拟时间轴位置（与 locate 线性映射互逆）
+  check('eventVt = offsetStart + (t − startT)',
+    P.eventVt(segSpan, cluster, 6) === 1000 && P.eventVt(segSpan, cluster, 3) === 0);
+  check('同毫秒事件共享同一虚拟位置（具体定位交给 pinnedIndex）',
+    P.eventVt(segSpan, cluster, 4) === P.eventVt(segSpan, cluster, 3));
+  check('eventVt 对缺失事件回退段起点，不抛异常',
+    P.eventVt(segSpan, cluster, 99) === 0 && P.eventVt(segSpan, null, 0) === 0);
+
+  console.log('六、清单读写事务：同一读写事务读当前清单并提交，多标签页并发不丢项');
   // 两条独立的模块实例（各自开关自己的 IndexedDB 连接），等价于两个标签页
   const P2 = loadBrowserModule('playlist.js', 'CuePlaylist');
   await new Promise((resolve) => {
@@ -295,7 +358,7 @@ async function main() {
   const cleared = await P.clear();
   check('clear 后为空文档且库内确为空', cleared.entries.length === 0 && (await P2.get()).entries.length === 0);
 
-  console.log('六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
+  console.log('七、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
   const pageResp = await getPage('/playlist.html');
   const page = pageResp.body;
   check('播放页可访问', pageResp.status === 200);
@@ -308,6 +371,9 @@ async function main() {
     /cue-playlists/.test(fs.readFileSync(path.join(__dirname, '..', 'public', 'playlist.js'), 'utf8')));
   check('页面含 1×/2×/4× 倍速与虚拟时间轴',
     ['data-speed="1"', 'data-speed="2"', 'data-speed="4"'].every((s) => page.includes(s)) && page.includes('pl-timeline'));
+  check('播放页按锚定事件行回放（foldUntilIndex + cutoffIndex + eventVt + 事件锁定）',
+    page.includes('foldUntilIndex') && page.includes('cutoffIndex') &&
+    page.includes('eventVt') && page.includes('seekToEvent'));
 
   const annResp = await getPage('/annotations.html');
   const annPage = annResp.body;

@@ -14,6 +14,14 @@
  * 线性映射回该段所属场次的原始相对时刻（localT = startT + (vt - segStart)）。
  * 边界规则：虚拟时刻恰好落在段边界上时进入后一段（零长段除外——零长段只能
  * 通过「定位到本段」的显式跳转呈现）。
+ *
+ * 段内事件边界：段的首尾是批注锚定的**事件行号**（startIndex / endIndex）。
+ * 同一毫秒内锚点前后可能还有确认 / 撤回等日志，仅按毫秒折叠会提前显示或
+ * 执行区间外事件（零时长段尤其明显）。因此段内现场按「原场次时间 + 日志
+ * 行序」共同回放：localT 经 cutoffIndex 换算为截至事件行号（段起点只到
+ * 起点锚点、段末不越过终点锚点），再由 ReplayCore.foldUntilIndex 按行号
+ * 折叠；事件列表 / 标记 / 点击跳转同样只覆盖锚定行范围，同毫秒的具体事件
+ * 靠 pinnedIndex 精确定位。
  */
 'use strict';
 
@@ -303,6 +311,49 @@ const CuePlaylist = (() => {
     return seg ? seg.offsetStart : 0;
   }
 
+  // -------------------------------------------------------------------------
+  // 段内「截至事件行号」解析：清单段按原场次时间与日志行序共同回放。
+  //
+  // localT 由虚拟时间轴线性映射而来（毫秒精度），但段边界是批注锚定的**事件
+  // 行号**——同一毫秒内锚点前后可能还有确认 / 撤回 / 重发等日志，毫秒无法
+  // 区分谁先谁后（行序即因果顺序）。因此现场折叠的截止点必须换算回行号：
+  //   - localT 恰在段起点（<= startT）：只呈现截至起点锚点（startIndex）的
+  //     现场，同毫秒排在锚点之后的事件一律不提前生效；
+  //   - 其余时刻：取行序上最后一条 t <= localT 的事件（与 foldUntil 同一
+  //     扫描口径），再钳制到 [startIndex, endIndex]——段末绝不越过终点锚点，
+  //     同毫秒排在终点锚点之后的事件不进本段；
+  //   - pinnedIndex（点击事件行 / 时间轴标记，定位同毫秒内的具体事件）优先
+  //     于时间换算，同样钳制在锚定行范围内。
+  // 返回值保证落在 [startIndex, endIndex]（并防御性钳到事件数组下标内）。
+  // -------------------------------------------------------------------------
+  function cutoffIndex(seg, events, localT, pinnedIndex) {
+    const list = Array.isArray(events) ? events : [];
+    const maxIdx = list.length - 1;
+    const lo = Math.max(0, Math.min(Number(seg && seg.startIndex) || 0, maxIdx));
+    const hi = Math.max(lo, Math.min(Number(seg && seg.endIndex) || 0, maxIdx));
+    if (Number.isInteger(pinnedIndex)) return Math.max(lo, Math.min(hi, pinnedIndex));
+    const t = Number(localT);
+    if (!Number.isFinite(t) || t <= (Number(seg && seg.startT) || 0)) return lo;
+    let idx = lo;
+    for (let i = 0; i < list.length; i++) {
+      const et = Number(list[i] && list[i].t);
+      if ((Number.isFinite(et) ? et : 0) > t) break;
+      idx = i;
+    }
+    return Math.max(lo, Math.min(hi, idx));
+  }
+
+  // 段内某条事件在虚拟时间轴上的位置（点击事件行 / 标记跳转的目标 vt）：
+  // 与 locate 的线性映射互逆。同一毫秒的多条事件共享同一虚拟位置，具体
+  // 定位到哪一条由 cutoffIndex 的 pinnedIndex 区分。
+  function eventVt(seg, events, index) {
+    const list = Array.isArray(events) ? events : [];
+    const ev = list[index];
+    const startT = Number(seg && seg.startT) || 0;
+    const t = ev && Number.isFinite(Number(ev.t)) ? Number(ev.t) : startT;
+    return (Number(seg && seg.offsetStart) || 0) + Math.max(0, t - startT);
+  }
+
   // 相对当前段跳转 deltaMs 虚拟时间（键盘 ← / →），并返回是否应解除强制段
   function nudge(segmentsWithOffsets, vt, deltaMs) {
     const total = totalDuration(segmentsWithOffsets);
@@ -378,6 +429,8 @@ const CuePlaylist = (() => {
     locateIndex,
     locate,
     segmentStartVt,
+    cutoffIndex,
+    eventVt,
     nudge,
     // 浏览器装配
     resolvePlaylist,

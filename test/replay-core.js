@@ -11,6 +11,7 @@
  *       绝不污染新轮；无 attemptId 的旧确认成为孤立事件；
  *   四、**未闭合暂停**：以轮次收口时刻截断、不产生负时长、不产生超时表；
  *   五、任意时刻重放（foldUntil）与全量折叠（foldEvents）经同一状态机；
+ *       foldUntilIndex 按日志行号截断，区分同一毫秒内的先后事件；
  *   六、三个消费者（复盘视图 / 对比指标 / 延迟诊断）在同一事件流上结论一致；
  *   七、缺字段 / 损坏事件降级跳过（告警与跳过策略在解析层，内核不抛异常）。
  */
@@ -369,6 +370,68 @@ async function main() {
     check('任意 t：foldUntil(events,t) === toViewState(foldEvents(events<=t))', consistent);
     check('重复折叠完全确定',
       JSON.stringify(Core.foldUntil(es, 4321)) === JSON.stringify(Core.foldUntil(es, 4321)));
+  }
+
+  console.log('七·二、foldUntilIndex：按日志行号截断，区分同一毫秒内的先后事件');
+  {
+    check('两侧均导出 foldUntilIndex',
+      typeof Core.foldUntilIndex === 'function' && typeof BrowserCore.foldUntilIndex === 'function');
+    // 同一毫秒挤着 确认 → 撤回 → 重发 → 新轮确认：毫秒折叠只能全有或全无，
+    // 行号折叠必须能精确停在任意一条之后（播放清单段锚点的截止语义）
+    const es = [
+      ev(0, 'session-start', {}),
+      ev(1000, 'cue-started', { seq: 1, text: '甲', targets: ['灯光', '音响'], revision: 1, attemptId: 'a1' }),
+      ev(2000, 'confirm', { seq: 1, position: '灯光', attemptId: 'a1' }),                       // idx 2
+      ev(2000, 'cue-recalled', { seq: 1, oldRevision: 1, newRevision: 2, oldAttemptId: 'a1', reason: '改词', newText: '甲二' }), // idx 3
+      ev(2000, 'cue-resent', { seq: 1, text: '甲二', reason: '改词', revision: 2, attemptId: 'a2' }), // idx 4
+      ev(2000, 'confirm', { seq: 1, position: '音响', attemptId: 'a2' }),                       // idx 5
+      ev(3000, 'cue-completed', { seq: 1, attemptId: 'a2' }),                                    // idx 6
+      ev(4000, 'sequence-finished', {}),                                                         // idx 7
+    ];
+    const at2 = Core.foldUntilIndex(es, 2);
+    check('截至 idx2（同毫秒簇第一条）：仍是第 1 版且灯光确认在场，撤回尚未生效',
+      at2.revision === 1 && at2.attemptId === 'a1' &&
+      !!at2.confirmations['灯光'] && at2.attempts.length === 0);
+    const at3 = Core.foldUntilIndex(es, 3);
+    check('截至 idx3：旧轮已封存 recalled，但修订重发尚未生效（仍第 1 版）',
+      at3.attempts.length === 1 && at3.attempts[0].endState === 'recalled' &&
+      at3.revision === 1 && at3.attemptId === 'a1');
+    const at4 = Core.foldUntilIndex(es, 4);
+    check('截至 idx4：修订轮已开启（第 2 版 / 新 attemptId），本轮确认清空',
+      at4.revision === 2 && at4.attemptId === 'a2' &&
+      Object.keys(at4.confirmations).length === 0 && at4.attempts.length === 1);
+    const at5 = Core.foldUntilIndex(es, 5);
+    check('截至 idx5：同毫秒的新轮确认生效（音响已确认）',
+      at5.revision === 2 && !!at5.confirmations['音响']);
+    check('毫秒折叠 foldUntil(2000) 无法区分上述中间态（四条全生效）',
+      Core.foldUntil(es, 2000).revision === 2 && !!Core.foldUntil(es, 2000).confirmations['音响']);
+    // 与全量折叠逐前缀等价：foldUntilIndex(es,i) === toViewState(foldEvents(es[0..i]))
+    let prefixEq = true;
+    for (let i = 0; i < es.length; i++) {
+      const a = Core.foldUntilIndex(es, i);
+      const b = Core.toViewState(Core.foldEvents(es.slice(0, i + 1)));
+      if (JSON.stringify(a) !== JSON.stringify(b)) { prefixEq = false; break; }
+    }
+    check('任意 i：foldUntilIndex(es,i) === toViewState(foldEvents(前 i+1 条))', prefixEq);
+    // 时间两两不同的事件流：行号折叠与毫秒折叠在每条事件处结论一致
+    const distinct = es.filter((e, i) => [0, 1, 6, 7].includes(i));
+    let timeEq = true;
+    for (let i = 0; i < distinct.length; i++) {
+      if (JSON.stringify(Core.foldUntilIndex(distinct, i)) !==
+          JSON.stringify(Core.foldUntil(distinct, distinct[i].t))) { timeEq = false; break; }
+    }
+    check('时间互不相同的流：foldUntilIndex(es,i) === foldUntil(es, es[i].t)', timeEq);
+    eq('Node 与浏览器形态的 foldUntilIndex 现场视图一致',
+      Core.foldUntilIndex(es, 4), BrowserCore.foldUntilIndex(es, 4));
+    // 防御性：负 index / 非数值 → 一条不折（初始现场）；超出末尾 → 折完全部
+    check('index=-1 得到初始现场（idle）', Core.foldUntilIndex(es, -1).phase === 'idle');
+    check('index 非数值得到初始现场', Core.foldUntilIndex(es, 'x').phase === 'idle' &&
+      Core.foldUntilIndex(es, NaN).phase === 'idle');
+    check('index 超出末尾折完全部（done）', Core.foldUntilIndex(es, 999).phase === 'done');
+    check('空事件数组不抛异常且为初始现场', Core.foldUntilIndex([], 3).phase === 'idle' &&
+      Core.foldUntilIndex(null, 3).phase === 'idle');
+    check('小数 index 向下取整（2.9 → 截至 idx2）',
+      JSON.stringify(Core.foldUntilIndex(es, 2.9)) === JSON.stringify(Core.foldUntilIndex(es, 2)));
   }
 
   console.log('八、三消费者同模型：复盘视图 / 对比指标 / 延迟诊断轮次结论一致');

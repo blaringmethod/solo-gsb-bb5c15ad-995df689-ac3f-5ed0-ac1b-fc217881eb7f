@@ -147,6 +147,9 @@
     const sessionData = new Map(); // "fileId/runId" -> 复盘接口 payload
     let vt = 0;                 // 虚拟时间轴位置（毫秒）
     let forceIndex = null;      // 显式定位的段（零长段跳转）；正常播放后立即解除
+    let pinEvent = null;        // 点击事件行 / 标记锁定的具体事件 { seg, index, vt }：
+                                // 同毫秒多条事件时精确呈现「截至该行」的现场；
+                                // vt 一变动（播放 / 拖动 / 跳转）即自动失效
     let playing = false;
     let speed = 1;
     let rafId = null;
@@ -233,6 +236,7 @@
     async function runResolve() {
       setPlaying(false);
       forceIndex = null;
+      pinEvent = null;
       resolveStatus.innerHTML = '正在按事件指纹重新定位清单中的每条批注…';
       skippedBox.style.display = 'none';
       const result = await CuePlaylist.resolvePlaylist(
@@ -284,6 +288,37 @@
     relocateBtn.addEventListener('click', () => { resolving = runResolve(); return resolving; });
 
     // ---------------------------------------------------------------------
+    // 当前定位：默认由虚拟时间轴映射（边界规则：恰好落在段边界进入后一段）。
+    // 若用户刚点击事件行 / 标记锁定了具体事件（pinEvent 未过期），则留在被
+    // 锁定段并精确呈现该事件的原始时刻——段末事件的 vt 恰好落在段边界上，
+    // 默认边界规则会滑入后一段，锁定期间除外；vt 一变动锁定即自动失效。
+    // ---------------------------------------------------------------------
+    function currentLocate() {
+      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      if (pinEvent && pinEvent.vt === vt && segments[pinEvent.seg]) {
+        const seg = segments[pinEvent.seg];
+        const payload = sessionData.get(refKey(seg.fileId, seg.runId));
+        const ev = payload && payload.events[pinEvent.index];
+        if (ev) {
+          const localT = Number(ev.t) || 0;
+          const progress = seg.durationMs > 0
+            ? Math.max(0, Math.min(1, (localT - seg.startT) / seg.durationMs)) : 1;
+          const total = CuePlaylist.totalDuration(segments);
+          return { index: pinEvent.seg, seg, localT, progress, atEnd: vt >= total && total > 0 };
+        }
+      }
+      return loc;
+    }
+
+    // 当前播放位置对应的「截至事件行号」：点击事件行 / 标记锁定的 pin 优先
+    // （pin 记录当时的 vt，vt 一变动即视为过期），否则按 localT 换算
+    function currentCutoff(loc, events) {
+      const pinned = pinEvent && pinEvent.seg === loc.index && pinEvent.vt === vt
+        ? pinEvent.index : null;
+      return CuePlaylist.cutoffIndex(loc.seg, events, loc.localT, pinned);
+    }
+
+    // ---------------------------------------------------------------------
     // 虚拟时间轴构建
     // ---------------------------------------------------------------------
     const SEG_COLORS = ['#2f6fed', '#8b5cf6', '#0f9d8f', '#b5651d', '#4caf7d', '#d9489a', '#5b8def'];
@@ -326,25 +361,27 @@
       timeEndEl.textContent = fmtT(total);
     }
 
-    // 当前段事件标记：虚拟坐标 = 段起点偏移 + 事件在段内的原始时刻差
+    // 当前段事件标记：虚拟坐标 = 段起点偏移 + 事件在段内的原始时刻差。
+    // 只画锚定行范围 [startIndex, endIndex] 内的事件——同毫秒排在锚点之外
+    // 的事件不属于本段；点击标记精确定位到该事件行（同毫秒可区分）。
     function renderTimelineMarkers() {
       timelineEl.querySelectorAll('.marker').forEach((el) => el.remove());
-      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      const loc = currentLocate();
       if (!loc) return;
       const payload = sessionData.get(refKey(loc.seg.fileId, loc.seg.runId));
       if (!payload) return;
       const total = Math.max(1, CuePlaylist.totalDuration(segments));
-      payload.events.forEach((ev) => {
-        if (ev.t < loc.seg.startT || ev.t > loc.seg.endT) return;
+      payload.events.forEach((ev, idx) => {
+        if (idx < loc.seg.startIndex || idx > loc.seg.endIndex) return;
         const mk = document.createElement('div');
         mk.className = 'marker';
-        const vpos = loc.seg.offsetStart + (ev.t - loc.seg.startT);
+        const vpos = CuePlaylist.eventVt(loc.seg, payload.events, idx);
         mk.style.left = `${Math.max(0, Math.min(100, (vpos / total) * 100))}%`;
         mk.style.background = WARN_EVENTS.has(ev.event) ? '#ff7676' : '#8ab4ff';
-        mk.title = `+${fmtT(ev.t)} ${Replay.eventLabel(ev.event)}：${detailText(ev)}`;
+        mk.title = `+${fmtT(ev.t)} ｜ 第 ${idx + 1} 条 ${Replay.eventLabel(ev.event)}：${detailText(ev)}`;
         mk.addEventListener('mousedown', (e) => {
           e.stopPropagation();
-          seekVirtual(loc.seg.offsetStart + (ev.t - loc.seg.startT));
+          seekToEvent(loc.index, idx);
         });
         timelineEl.appendChild(mk);
       });
@@ -379,15 +416,18 @@
     }
 
     // ---------------------------------------------------------------------
-    // 当前现场渲染：定位虚拟时刻 -> 映射原场次原始时刻 -> foldUntil
+    // 当前现场渲染：定位虚拟时刻 -> 映射原场次原始时刻 -> 换算截至事件行号
+    // -> foldUntilIndex 按日志行序折叠（段起点只到起点锚点、段末不越过终点
+    // 锚点；同一毫秒内的先后由行号区分，毫秒折叠做不到这一点）
     // ---------------------------------------------------------------------
     function renderState() {
-      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      const loc = currentLocate();
       if (!loc) return;
       const seg = loc.seg;
       const payload = sessionData.get(refKey(seg.fileId, seg.runId));
       const events = payload ? payload.events : [];
-      const s = Replay.foldUntil(events, loc.localT);
+      const cut = currentCutoff(loc, events);
+      const s = Replay.foldUntilIndex(events, cut);
       const view = Replay.viewOf(s);
 
       const phaseText = { idle: '待开始', active: '口令进行中', between: '口令已完成（待推进）', done: '全场已结束' }[s.phase];
@@ -450,33 +490,35 @@
       }).join('');
     }
 
-    // 当前段事件列表（只展示区间覆盖的事件，按本场原始时刻）
+    // 当前段事件列表：只覆盖锚定行范围 [startIndex, endIndex]（同毫秒排在
+    // 锚点之外的事件不进列表）；「已生效」按截至事件行号判定，点击某行精确
+    // 跳到该事件——同一毫秒的多条事件也能逐条定位
     function renderEventList() {
-      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      const loc = currentLocate();
       if (!loc) return;
       const payload = sessionData.get(refKey(loc.seg.fileId, loc.seg.runId));
       if (!payload) { eventList.innerHTML = '<div class="muted">场次数据缺失。</div>'; return; }
+      const cut = currentCutoff(loc, payload.events);
       const rows = [];
-      payload.events.forEach((ev) => {
-        if (ev.t < loc.seg.startT || ev.t > loc.seg.endT) return;
-        const applied = ev.t <= loc.localT;
-        rows.push({ ev, applied, vpos: loc.seg.offsetStart + (ev.t - loc.seg.startT) });
+      payload.events.forEach((ev, idx) => {
+        if (idx < loc.seg.startIndex || idx > loc.seg.endIndex) return;
+        rows.push({ ev, idx, applied: idx <= cut });
       });
-      eventList.innerHTML = rows.map(({ ev, applied, vpos }) =>
-        `<div class="replay-event-row ${WARN_EVENTS.has(ev.event) ? 'is-warn' : ''} ${applied ? 'applied' : ''}" data-vt="${vpos}">` +
-        `<span class="replay-event-t">+${fmtT(ev.t)}</span>` +
+      eventList.innerHTML = rows.map(({ ev, idx, applied }) =>
+        `<div class="replay-event-row ${WARN_EVENTS.has(ev.event) ? 'is-warn' : ''} ${applied ? 'applied' : ''}" data-idx="${idx}">` +
+        `<span class="replay-event-t">+${fmtT(ev.t)}<span class="muted" style="font-size:11px">｜第 ${idx + 1} 条</span></span>` +
         `<span class="replay-event-name">${esc(Replay.eventLabel(ev.event))}</span>` +
         `<span class="replay-event-detail">${esc(detailText(ev))}</span></div>`
       ).join('') || '<div class="muted">本段无事件。</div>';
       eventList.querySelectorAll('.replay-event-row').forEach((row) => {
-        row.addEventListener('click', () => seekVirtual(Number(row.dataset.vt)));
+        row.addEventListener('click', () => seekToEvent(loc.index, Number(row.dataset.idx)));
       });
       const appliedEl = eventList.querySelector('.replay-event-row.applied:last-of-type');
       if (playing && appliedEl) appliedEl.scrollIntoView({ block: 'nearest' });
     }
 
     function renderSegContext(activeIndex) {
-      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      const loc = currentLocate();
       if (!loc) { segContext.innerHTML = ''; return; }
       const seg = loc.seg;
       const ann = annotationById(seg.entryId);
@@ -490,7 +532,8 @@
         <div class="pl-ctx-text">${esc((ann && ann.text) || '（无批注文本）')}
           <span class="muted">${(ann && ann.tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</span>
         </div>`;
-      segMetaLine.textContent = `本段映射到「${sessionLabelOf(seg)}」的区间 +${fmtT(seg.startT)} → +${fmtT(seg.endT)}；点击事件行跳到对应虚拟时刻。`;
+      segMetaLine.textContent = `本段映射到「${sessionLabelOf(seg)}」的区间 +${fmtT(seg.startT)} → +${fmtT(seg.endT)}，` +
+        `锚定本场第 ${seg.startIndex + 1} – ${seg.endIndex + 1} 条事件（同毫秒的先后按日志行序回放）；点击事件行跳到对应虚拟时刻。`;
       segOverview.querySelectorAll('.pl-seg-row').forEach((row, i) =>
         row.classList.toggle('active', i === loc.index));
     }
@@ -502,7 +545,7 @@
     }
 
     function render() {
-      const loc = CuePlaylist.locate(segments, vt, forceIndex);
+      const loc = currentLocate();
       if (!loc) return;
       if (loc.index !== lastSegIndex) {
         // 跨场次（或跨段）切换：重建当前段标记；现场按新场次 fold
@@ -533,8 +576,9 @@
       if (playing) {
         const total = CuePlaylist.totalDuration(segments);
         if (vt >= total) { vt = 0; forceIndex = null; }
-        // 开始正常播放即解除零长段的显式定位（让边界规则接管）
+        // 开始正常播放即解除零长段的显式定位与具体事件锁定（让边界规则接管）
         forceIndex = null;
+        pinEvent = null;
         lastFrameAt = performance.now();
         const tick = (now) => {
           if (!playing) return;
@@ -556,6 +600,22 @@
       const total = CuePlaylist.totalDuration(segments);
       vt = Math.max(0, Math.min(total, Number(t) || 0));
       forceIndex = null; // 用户主动 seek 后恢复「边界进入后一段」的默认规则
+      pinEvent = null;   // 按时间拖动后解除具体事件锁定
+      render();
+    }
+
+    // 点击事件行 / 时间轴标记：跳到该事件的虚拟位置，并把「截至事件行号」
+    // 锁定到这一行——同一毫秒的多条事件由此可逐条精确定位；锁定随下一次
+    // 播放 / 拖动 / 跳转自动解除（pinEvent 记录了当时的 vt，vt 变即失效）
+    function seekToEvent(segIndex, eventIndex) {
+      const seg = segments[segIndex];
+      const payload = seg && sessionData.get(refKey(seg.fileId, seg.runId));
+      if (!payload || !payload.events[eventIndex]) return;
+      vt = Math.max(0, Math.min(CuePlaylist.totalDuration(segments),
+        CuePlaylist.eventVt(seg, payload.events, eventIndex)));
+      // 零长段不占虚拟时长，必须保持显式定位，否则边界规则会滑入后一段
+      forceIndex = seg.durationMs === 0 ? segIndex : null;
+      pinEvent = { seg: segIndex, index: eventIndex, vt };
       render();
     }
 
@@ -564,6 +624,7 @@
       if (!seg) return;
       setPlaying(false);
       forceIndex = i; // 零长段也可精确呈现
+      pinEvent = null;
       vt = seg.offsetStart;
       render();
     }
@@ -609,6 +670,7 @@
       await Promise.all(segments.map((seg) => getPayload(seg.fileId, seg.runId)));
       vt = 0;
       forceIndex = null;
+      pinEvent = null;
       lastSegIndex = -1;
       buildTimeline();
       renderOverview(0);

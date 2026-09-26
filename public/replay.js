@@ -5,6 +5,7 @@
  *
  *   - 复盘任意时刻重放：Replay.foldUntil(events, targetT) 从本场起点
  *     （session-start）按事件日志行序逐事件折叠（同内核，同 compare / latency）；
+ *     播放清单段按锚定事件行截断时用 Replay.foldUntilIndex(events, index)；
  *   - 场次对比（compare.js，Node 侧 require 同一文件）与确认延迟诊断
  *     （public/latency.js）复用同一份轮次 / 暂停 / 替岗 / 修订模型；
  *   - 消费者只负责筛选和展示，任何时刻的现场都由同一状态机重新折叠得到，
@@ -21,6 +22,7 @@ const Replay = (() => {
     foldEvent,
     foldEvents,
     foldUntil,
+    foldUntilIndex,
     initialState,
     effectiveTargets,
     viewOf,
@@ -100,6 +102,7 @@ const Replay = (() => {
     foldEvent,
     foldEvents,
     foldUntil,
+    foldUntilIndex,
     effectiveTargets,
     viewOf,
     positionsOf,

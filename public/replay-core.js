@@ -12,7 +12,10 @@
  *
  * 时间语义：消费者只负责筛选与展示。任意时刻的现场都由 foldUntil 从场次起点
  * （session-start）按**日志行序**（而非时间戳重排）逐事件折叠得到；同一毫秒内
- * cue-recalled 必然先于 cue-resent 落盘，行序即因果顺序。
+ * cue-recalled 必然先于 cue-resent 落盘，行序即因果顺序。复盘播放清单的段边界
+ * 是批注锚定的事件行号，同一毫秒内锚点前后可能还有确认 / 撤回等日志，毫秒折叠
+ * 无法区分——foldUntilIndex 以同一 reducer 按行号截断，段起点恰好截至起点锚点、
+ * 段末不越过终点锚点。
  *
  * 暂停区间同样按日志行序归一：同一轮次尚未恢复时重复 cue-paused 不开启新区间、
  * 孤立 cue-resumed 不制造零长暂停；消费者收口时统一调用 normalizePauses 做越界
@@ -608,6 +611,23 @@ const ReplayCore = (() => {
     return toViewState(s);
   }
 
+  // foldUntil 的「日志行号」版本：从场次起点折叠到第 index 条事件（含）为止。
+  // 毫秒折叠无法区分同一毫秒内的多条事件（确认 / 撤回 / 重发常挤在同一 ms），
+  // 而复盘播放清单的段边界是批注锚定的**事件行号**：段起点要恰好截至起点锚点、
+  // 段末不得越过终点锚点，只有按行号截断才能保证。行序即因果顺序，本函数与
+  // foldUntil 共用同一 reducer，只是截止条件从「毫秒」换成「行号」。
+  // 防御性：index 非有限数 / 负数 → 一条不折（初始现场）；超出末尾 → 折完全部。
+  function foldUntilIndex(events, index, opts = {}) {
+    const s = initialState();
+    const timeoutSec = Number(opts.timeoutSec);
+    if (Number.isFinite(timeoutSec) && timeoutSec > 0) s.timeoutSec = timeoutSec;
+    const list = Array.isArray(events) ? events : [];
+    const n = Number(index);
+    const last = Number.isFinite(n) ? Math.min(Math.floor(n), list.length - 1) : -1;
+    for (let i = 0; i <= last; i++) foldEvent(s, list[i]);
+    return toViewState(s);
+  }
+
   // 富折叠状态 → 复盘现场视图（无环、字段与历史 foldUntil 输出逐一同形）
   function toViewState(s) {
     return {
@@ -686,6 +706,7 @@ const ReplayCore = (() => {
     foldEvent,
     foldEvents,
     foldUntil,
+    foldUntilIndex,
     normalizePauses,
     toViewState,
     effectiveTargets,
