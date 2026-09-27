@@ -42,6 +42,7 @@ function loadBrowserModule(file, factoryName) {
 const A = loadBrowserModule('annotations.js', 'CueAnnotations');
 globalThis.CueAnnotations = A; // resolvePlaylist 经 globalThis.CueAnnotations 访问
 const P = loadBrowserModule('playlist.js', 'CuePlaylist');
+const Core = require('../public/replay-core'); // 共享折叠内核（foldUntilIndex 联动断言）
 
 function httpGet(urlPath) {
   return new Promise((resolve, reject) => {
@@ -212,6 +213,57 @@ async function main() {
   // nudge：键盘跳转在虚拟轴上 clamp 并解除强制段
   const n = P.nudge(cross, 4500, 1000);
   check('nudge 超出末端 clamp', n.vt === 5000 && n.releaseForce === true);
+
+  console.log('四之补、段边界按行序收口（cutoffIndex）：同毫秒事件不越锚点、可逐行定位');
+  // 锚点前后同一毫秒内还有确认 / 重复确认 / 撤回等日志：段边界不得把它们算进来
+  const isoL = (ms) => new Date(Date.parse('2026-09-19T10:00:00.000Z') + ms).toISOString();
+  const lineEvents = [
+    ev(isoL(0), 0, 'session-start', {}),                                        // 0
+    ev(isoL(1000), 1000, 'cue-started', { seq: 1, text: '甲', targets: ['灯光'] }), // 1 ← 起点锚点
+    ev(isoL(1000), 1000, 'confirm', { seq: 1, position: '灯光' }),              // 2 同毫秒，起点锚点之后
+    ev(isoL(1500), 1500, 'cue-paused', { seq: 1, reason: '挂起' }),             // 3
+    ev(isoL(2000), 2000, 'cue-resumed', { seq: 1 }),                            // 4 ← 终点锚点
+    ev(isoL(2000), 2000, 'confirm-duplicate', { seq: 1, position: '灯光' }),    // 5 同毫秒，终点锚点之后
+    ev(isoL(2000), 2000, 'cue-recalled', { seq: 1, reason: '改词' }),           // 6 同毫秒，区间外
+    ev(isoL(5000), 5000, 'sequence-finished', {}),                              // 7
+  ];
+  const segL = { entryId: 'L', fileId: 'f', runId: 0, startIndex: 1, endIndex: 4, startT: 1000, endT: 2000, durationMs: 1000 };
+  check('段起点只呈现截至起点锚点的现场（不含同毫秒确认 2）',
+    P.cutoffIndex(segL, lineEvents, 1000) === 1);
+  check('段起点之前同样收口到起点锚点', P.cutoffIndex(segL, lineEvents, 999) === 1);
+  check('段中按时间折叠到最后一个不晚于 localT 的事件（1200 → 2）',
+    P.cutoffIndex(segL, lineEvents, 1200) === 2);
+  check('段中推进（1999 → 3，同毫秒组未整体提前）',
+    P.cutoffIndex(segL, lineEvents, 1999) === 3);
+  check('段末不越过终点锚点（2000 → 4，不含同毫秒 5/6）',
+    P.cutoffIndex(segL, lineEvents, 2000) === 4);
+  check('越过段末仍收口到终点锚点（2600 → 4）',
+    P.cutoffIndex(segL, lineEvents, 2600) === 4);
+  check('forceEventIndex 精确定位同毫秒的具体事件（→ 2）',
+    P.cutoffIndex(segL, lineEvents, 1000, 2) === 2);
+  check('forceEventIndex 越界收敛到锚定行范围（6→4、0→1）',
+    P.cutoffIndex(segL, lineEvents, 1000, 6) === 4 && P.cutoffIndex(segL, lineEvents, 1000, 0) === 1);
+
+  // 零时长段：唯一时刻呈现到终点锚点，同毫秒区间外事件绝不带入
+  const segZ = { entryId: 'Z', fileId: 'f', runId: 0, startIndex: 4, endIndex: 5, startT: 2000, endT: 2000, durationMs: 0 };
+  check('零长段唯一时刻折叠到终点锚点（→ 5，不含同毫秒撤回 6）',
+    P.cutoffIndex(segZ, lineEvents, 2000) === 5);
+  check('零长段内仍可用 forceEventIndex 定位起点事件（→ 4）',
+    P.cutoffIndex(segZ, lineEvents, 2000, 4) === 4);
+  check('非法 localT 回退起点锚点，不抛异常',
+    P.cutoffIndex(segL, lineEvents, NaN) === 1);
+
+  // 与共享内核 foldUntilIndex 联动：段起点 / 段末现场严格按锚点行收口
+  const startView = Core.foldUntilIndex(lineEvents, P.cutoffIndex(segL, lineEvents, 1000));
+  check('段起点现场：口令已发出，但同毫秒确认未提前应用',
+    startView.seq === 1 && Object.keys(startView.confirmations).length === 0);
+  const endView = Core.foldUntilIndex(lineEvents, P.cutoffIndex(segL, lineEvents, 2000));
+  check('段末现场：恢复已应用，区间外同毫秒重复确认 / 撤回未执行',
+    endView.paused === false && endView.revision === 1 && endView.attempts.length === 0);
+  const zeroView = Core.foldUntilIndex(lineEvents, P.cutoffIndex(segZ, lineEvents, 2000));
+  check('零长段现场：呈现到终点锚点（重复确认已刻度），撤回仍未执行',
+    zeroView.paused === false && zeroView.attempts.length === 0 &&
+    Object.keys(zeroView.confirmations).length === 1);
 
   console.log('五、清单读写事务：同一读写事务读当前清单并提交，多标签页并发不丢项');
   // 两条独立的模块实例（各自开关自己的 IndexedDB 连接），等价于两个标签页

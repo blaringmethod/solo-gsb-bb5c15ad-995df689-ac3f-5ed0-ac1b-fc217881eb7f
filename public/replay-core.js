@@ -5,7 +5,9 @@
  *   - compare.js         场次对比：从折叠模型提取逐口令指标（耗时 / 超时 / 迟到 /
  *                        修订 / 暂停计数与最终文本）；
  *   - public/latency.js  确认延迟诊断：按 attemptId 取每个口令的全部轮次，
- *                        暂停区间、替岗、迟到 / 超时与旧轮次拒绝均已归属到轮次。
+ *                        暂停区间、替岗、迟到 / 超时与旧轮次拒绝均已归属到轮次；
+ *   - playlist.html      复盘播放清单：foldUntilIndex(events, i) 按日志行序把
+ *                        段边界精确收口到批注锚点行（同毫秒事件不越锚点）。
  *
  * 纯函数保证：不发起任何 I/O、不引用当前演出内存状态、不依赖 WebSocket / DOM /
  * Node 内置模块；输入事件数组与可选时限，输出全新的折叠状态，重复折叠结果严格一致。
@@ -608,6 +610,29 @@ const ReplayCore = (() => {
     return toViewState(s);
   }
 
+  // 从场次起点按日志行序折叠到指定事件下标（含该行）：与 foldUntil 同一状态机、
+  // 同一视图输出，只是截止条件由「毫秒偏移」换成「事件下标」。
+  //
+  // 用途：复盘播放清单的段边界。批注重定位后段首 / 段尾锚点落在具体日志行上，
+  // 同一毫秒内锚点前后可能还有确认、撤回等事件——按毫秒折叠会把它们整体提前
+  // 或越界应用；按下标折叠可把现场精确收口到锚点行（段起点只到起点锚点、
+  // 段末不越过终点锚点），同毫秒事件也能逐行区分。
+  //
+  // 防御性口径：cutIndex 向下取整；负值 / 非数 → 空折叠（初始现场）；
+  // 超出事件数 → 全量折叠（等价 toViewState(foldEvents(events))）。
+  function foldUntilIndex(events, cutIndex, opts = {}) {
+    const s = initialState();
+    const timeoutSec = Number(opts.timeoutSec);
+    if (Number.isFinite(timeoutSec) && timeoutSec > 0) s.timeoutSec = timeoutSec;
+    const list = Array.isArray(events) ? events : [];
+    const cut = Number(cutIndex);
+    const n = Number.isFinite(cut)
+      ? Math.min(list.length, Math.max(0, Math.floor(cut) + 1))
+      : 0;
+    for (let i = 0; i < n; i++) foldEvent(s, list[i]);
+    return toViewState(s);
+  }
+
   // 富折叠状态 → 复盘现场视图（无环、字段与历史 foldUntil 输出逐一同形）
   function toViewState(s) {
     return {
@@ -686,6 +711,7 @@ const ReplayCore = (() => {
     foldEvent,
     foldEvents,
     foldUntil,
+    foldUntilIndex,
     normalizePauses,
     toViewState,
     effectiveTargets,

@@ -59,8 +59,8 @@ function standardEvents(overrides = []) {
 
 async function main() {
   console.log('一、双端同一份内核：Node 实体与浏览器 <script> 形态导出一致');
-  check('两侧均导出 foldEvent / foldEvents / foldUntil / extractCues / viewOf',
-    ['foldEvent', 'foldEvents', 'foldUntil', 'extractCues', 'viewOf', 'initialState']
+  check('两侧均导出 foldEvent / foldEvents / foldUntil / foldUntilIndex / extractCues / viewOf',
+    ['foldEvent', 'foldEvents', 'foldUntil', 'foldUntilIndex', 'extractCues', 'viewOf', 'initialState']
       .every((k) => typeof Core[k] === 'function' && typeof BrowserCore[k] === 'function'));
   {
     const es = standardEvents();
@@ -69,6 +69,8 @@ async function main() {
       BrowserCore.foldEvents(es).cues.map((c) => ({ seq: c.seq, r: c.rounds.length })));
     eq('Node 与浏览器形态的 foldUntil 现场视图一致',
       Core.foldUntil(es, 1000), BrowserCore.foldUntil(es, 1000));
+    eq('Node 与浏览器形态的 foldUntilIndex 现场视图一致',
+      Core.foldUntilIndex(es, 2), BrowserCore.foldUntilIndex(es, 2));
   }
 
   console.log('二、初始状态与确定性');
@@ -124,6 +126,44 @@ async function main() {
     check('调换行序：a2 保持开启未被误封存，a1 仅封存自身',
       swCue.rounds[1].attemptId === 'a2' && !swCue.rounds[1].endState &&
       swCue.rounds[0].endState === 'recalled');
+  }
+
+  console.log('三之补、foldUntilIndex：按日志行序（事件下标）折叠，同毫秒逐行收口');
+  {
+    // 同一毫秒内 recall → resend → confirm 连续落盘：毫秒折叠只能整组应用，
+    // 下标折叠可以停在组内任意一行（播放清单段边界 / 事件定位依赖此能力）
+    const es = [
+      ev(0, 'session-start', {}),
+      ev(0, 'cue-started', { seq: 1, text: '甲', targets: ['灯光'], revision: 1, attemptId: 'a1' }),
+      ev(1000, 'confirm', { seq: 1, position: '灯光', attemptId: 'a1' }),
+      ev(2000, 'cue-recalled', { seq: 1, oldRevision: 1, newRevision: 2, oldAttemptId: 'a1', reason: '改词', newText: '甲二' }),
+      ev(2000, 'cue-resent', { seq: 1, text: '甲二', reason: '改词', revision: 2, attemptId: 'a2' }),
+      ev(2000, 'confirm', { seq: 1, position: '灯光', attemptId: 'a2' }),
+      ev(3000, 'cue-completed', { seq: 1, attemptId: 'a2' }),
+    ];
+    const atRecall = Core.foldUntilIndex(es, 3);
+    check('折叠到同毫秒组首行（recalled）：旧轮已封存、修订轮尚未生效',
+      atRecall.attemptId === 'a1' && atRecall.revision === 1 &&
+      atRecall.attempts.length === 1 && atRecall.attempts[0].endState === 'recalled');
+    const atResent = Core.foldUntilIndex(es, 4);
+    check('折叠到组内第二行（resent）：新轮生效，同毫秒确认尚未应用',
+      atResent.attemptId === 'a2' && atResent.revision === 2 &&
+      Object.keys(atResent.confirmations).length === 0);
+    check('折叠到组内末行：同毫秒确认按行应用',
+      !!Core.foldUntilIndex(es, 5).confirmations['灯光']);
+    eq('毫秒折叠 ≡ 同毫秒组末行的下标折叠（foldUntil(2000) = foldUntilIndex(5)）',
+      Core.foldUntil(es, 2000), Core.foldUntilIndex(es, 5));
+    eq('组前时刻 ≡ 组前末行（foldUntil(1999) = foldUntilIndex(2)）',
+      Core.foldUntil(es, 1999), Core.foldUntilIndex(es, 2));
+    eq('末行下标 ≡ 覆盖全部事件的毫秒折叠（foldUntilIndex(6) = foldUntil(3000)）',
+      Core.foldUntilIndex(es, 6), Core.foldUntil(es, 3000));
+    eq('下标超出事件数 ≡ 全量折叠视图（toViewState(foldEvents)）',
+      Core.foldUntilIndex(es, 999), Core.toViewState(Core.foldEvents(es)));
+    check('负下标 → 空折叠（初始现场 idle）', Core.foldUntilIndex(es, -1).phase === 'idle');
+    check('非数下标 → 空折叠且不抛异常', Core.foldUntilIndex(es, NaN).phase === 'idle');
+    eq('小数下标向下取整（2.9 ≡ 2）', Core.foldUntilIndex(es, 2.9), Core.foldUntilIndex(es, 2));
+    check('重复折叠完全确定',
+      JSON.stringify(Core.foldUntilIndex(es, 4)) === JSON.stringify(Core.foldUntilIndex(es, 4)));
   }
 
   console.log('四、旧 attemptId：迟到的旧轮消息只归属旧轮，绝不污染新轮');

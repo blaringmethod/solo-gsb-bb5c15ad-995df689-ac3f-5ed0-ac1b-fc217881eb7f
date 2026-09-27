@@ -14,6 +14,13 @@
  * 线性映射回该段所属场次的原始相对时刻（localT = startT + (vt - segStart)）。
  * 边界规则：虚拟时刻恰好落在段边界上时进入后一段（零长段除外——零长段只能
  * 通过「定位到本段」的显式跳转呈现）。
+ *
+ * 段边界按「原场次时间 + 日志行序」双重收口：重定位后段上带有首尾锚点的
+ * 事件下标（startIndex / endIndex），段内现场由 cutoffIndex 换算出的截止行
+ * 经 ReplayCore.foldUntilIndex 折叠得到——段起点只呈现截至起点锚点的现场、
+ * 段末不越过终点锚点；同一毫秒内锚点前后的确认 / 撤回等日志绝不提前或越界
+ * 应用（零时长段尤其如此）。段内事件列表 / 标记 / 点击跳转同样只覆盖
+ * [startIndex, endIndex] 的锚定行范围，同毫秒事件可按行序精确定位。
  */
 'use strict';
 
@@ -199,6 +206,8 @@ const CuePlaylist = (() => {
   //   segments —— 可播放段，严格保持清单顺序，不按场次归并、不合并重叠：
   //     [{ entryId, fileId, runId, startIndex, endIndex, startT, endT,
   //        durationMs }]
+  //     其中 startIndex / endIndex 为首尾锚点在本场事件数组中的下标（日志行序），
+  //     是段边界行序收口（cutoffIndex）与段内事件列表 / 标记范围的依据。
   //   skipped —— 无法播放的条目（批注缺失 / 场次日志缺失 / 批注失效）：
   //     [{ entryId, reason, annotation? }]
   // resolvedMap: annotationId ->
@@ -309,6 +318,37 @@ const CuePlaylist = (() => {
     return { vt: Math.max(0, Math.min(total, (Number(vt) || 0) + deltaMs)), releaseForce: true };
   }
 
+  // -------------------------------------------------------------------------
+  // 段内折叠边界（纯函数）：把段映射出的原始时刻 localT 换算成「截止事件下标」，
+  // 供 ReplayCore.foldUntilIndex 按日志行序折叠。规则：
+  //   - localT <= startT（段起点）：只呈现截至起点锚点的现场 → startIndex
+  //     （同一毫秒内排在起点锚点之后的事件不提前应用）；
+  //   - localT >= endT（段末，含零长段的唯一时刻）：不越过终点锚点 → endIndex
+  //     （同一毫秒内排在终点锚点之后的事件绝不执行）；
+  //   - 段中：与复盘页同一口径，按时间折叠到最后一个 t <= localT 的事件
+  //     （同毫秒组整体应用），并双向收敛到锚定行范围内；
+  //   - forceEventIndex（点击事件行 / 标记的显式定位）：直接以该行为截止，
+  //     同毫秒的具体事件由此可区分；越界时收敛到锚定行范围。
+  // -------------------------------------------------------------------------
+  function cutoffIndex(seg, events, localT, forceEventIndex) {
+    const lo = Number.isInteger(seg && seg.startIndex) ? seg.startIndex : 0;
+    const hi = Number.isInteger(seg && seg.endIndex) ? seg.endIndex : lo;
+    if (Number.isInteger(forceEventIndex)) {
+      return Math.max(lo, Math.min(hi, forceEventIndex));
+    }
+    const t = Number(localT);
+    if (!Number.isFinite(t)) return lo;
+    if (t >= seg.endT) return hi;
+    if (t <= seg.startT) return lo;
+    const list = Array.isArray(events) ? events : [];
+    let idx = lo;
+    for (let i = 0; i < list.length; i++) {
+      const et = Number(list[i] && list[i].t);
+      if (Number.isFinite(et) && et <= t) idx = i;
+    }
+    return Math.max(lo, Math.min(hi, idx));
+  }
+
   // 播放前批量重定位的浏览器装配器（异步，含场次缓存）：
   //   entries        —— 清单文档的 entries（或仅 id 数组）
   //   annotations    —— CueAnnotations.getAll() 的结果
@@ -379,6 +419,7 @@ const CuePlaylist = (() => {
     locate,
     segmentStartVt,
     nudge,
+    cutoffIndex,
     // 浏览器装配
     resolvePlaylist,
   };
